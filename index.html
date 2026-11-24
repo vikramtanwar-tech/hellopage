@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OIDC User Attributes</title>
+<style>
+  :root {
+    --bg: #f5f7fa; --card: #ffffff; --text: #1d2330; --muted: #5d6677;
+    --border: #dde2ea; --accent: #2457d6; --accent-text: #ffffff;
+    --ok: #1f8a4c; --err: #c23b3b; --code: #f0f3f8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151c; --card: #1b2029; --text: #e6e9ef; --muted: #9aa3b2;
+      --border: #2c3340; --accent: #5b8cff; --accent-text: #0d1117;
+      --ok: #4cc27e; --err: #ff7676; --code: #232a35;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--border);
+    background: var(--card);
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; margin-bottom: 20px;
+  }
+  .card h2 { font-size: 16px; margin: 0 0 12px; }
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; padding: 8px 16px;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text);
+  }
+  button.secondary { background: transparent; color: var(--accent); }
+  .muted { color: var(--muted); }
+  .error { color: var(--err); white-space: pre-wrap; }
+  .ok { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+  th, td {
+    text-align: left; vertical-align: top; padding: 8px 10px;
+    border-bottom: 1px solid var(--border); overflow-wrap: anywhere;
+  }
+  th { width: 32%; font-weight: 600; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+  td small { color: var(--muted); display: block; }
+  pre {
+    background: var(--code); padding: 12px; border-radius: 8px;
+    overflow: auto; font-size: 12.5px; margin: 0;
+  }
+  details summary { cursor: pointer; margin: 8px 0; color: var(--muted); }
+  .profile { display: flex; align-items: center; gap: 16px; }
+  .profile img { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>OIDC User Attributes</h1>
+  <div>
+    <button id="loginBtn" class="hidden">Sign in</button>
+    <button id="logoutBtn" class="secondary hidden">Sign out</button>
+  </div>
+</header>
+
+<main>
+  <div id="status" class="card hidden"></div>
+
+  <div id="welcome" class="card hidden">
+    <h2>Welcome</h2>
+    <p class="muted">You are not signed in. Click <b>Sign in</b> to authenticate with your identity provider.
+      After you sign in, this page shows the attributes (claims) the IdP returns.</p>
+  </div>
+
+  <div id="profileCard" class="card hidden">
+    <div class="profile">
+      <img id="avatar" alt="" class="hidden">
+      <div>
+        <div id="displayName" style="font-size:18px;font-weight:600"></div>
+        <div id="displaySub" class="muted"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="idTokenCard" class="card hidden">
+    <h2>ID token claims</h2>
+    <table id="idTokenTable"></table>
+  </div>
+
+  <div id="userInfoCard" class="card hidden">
+    <h2>UserInfo endpoint attributes</h2>
+    <table id="userInfoTable"></table>
+  </div>
+
+  <div id="rawCard" class="card hidden">
+    <h2>Raw data</h2>
+    <details><summary>ID token (decoded JSON)</summary><pre id="rawIdToken"></pre></details>
+    <details><summary>UserInfo response</summary><pre id="rawUserInfo"></pre></details>
+    <details><summary>Access token claims (if JWT)</summary><pre id="rawAccessToken"></pre></details>
+    <details><summary>Token response (tokens truncated)</summary><pre id="rawTokenResponse"></pre></details>
+  </div>
+</main>
+
+<script>
+/* =====================================================================
+ *  CONFIGURATION: edit these values for your IdP / OIDC application
+ * ===================================================================== */
+const OIDC_CONFIG = {
+  // Issuer / authority URL. The page loads
+  // <authority>/.well-known/openid-configuration
+  authority: "https://YOUR-IDP-DOMAIN/oauth2/default",
+
+  // Client ID of the OIDC app (configure it as a public/SPA client with PKCE, no secret)
+  clientId: "YOUR_CLIENT_ID",
+
+  // Scopes to request
+  scope: "openid profile email",
+
+  // Must exactly match a redirect URI registered in the IdP.
+  // Default: this page's URL, e.g. https://<user>.github.io/<repo>/
+  redirectUri: window.location.origin + window.location.pathname,
+
+  // Where the IdP sends the user after logout (register it in the IdP too)
+  postLogoutRedirectUri: window.location.origin + window.location.pathname,
+
+  // Call the UserInfo endpoint after login
+  fetchUserInfo: true,
+};
+/* ===================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const store = sessionStorage;
+const KEYS = { pkce: "oidc_pkce", session: "oidc_session" };
+
+// ---------- helpers ----------
+function b64urlEncode(bytes) {
+  let s = "";
+  bytes.forEach((b) => (s += String.fromCharCode(b)));
+  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecodeToString(str) {
+  str = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  const bin = atob(str);
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+function randomString(len = 64) {
+  const arr = new Uint8Array(len);
+  crypto.getRandomValues(arr);
+  return b64urlEncode(arr);
+}
+async function sha256b64url(input) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return b64urlEncode(new Uint8Array(digest));
+}
+function decodeJwt(token) {
+  const parts = (token || "").split(".");
+  if (parts.length !== 3) return null;
+  try { return JSON.parse(b64urlDecodeToString(parts[1])); } catch { return null; }
+}
+function escapeHtml(v) {
+  return String(v).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function show(id, visible = true) { $(id).classList.toggle("hidden", !visible); }
+function setStatus(html, isError = false) {
+  const el = $("status");
+  el.innerHTML = isError ? `<div class="error">${html}</div>` : html;
+  show("status", true);
+}
+
+let discoveryCache = null;
+async function discovery() {
+  if (discoveryCache) return discoveryCache;
+  const url = OIDC_CONFIG.authority.replace(/\/+$/, "") + "/.well-known/openid-configuration";
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Discovery failed (${res.status}) at ${url}`);
+  discoveryCache = await res.json();
+  return discoveryCache;
+}
+
+// ---------- login ----------
+async function login() {
+  try {
+    const d = await discovery();
+    const verifier = randomString(64);
+    const state = randomString(24);
+    const nonce = randomString(24);
+    store.setItem(KEYS.pkce, JSON.stringify({ verifier, state, nonce }));
+
+    const params = new URLSearchParams({
+      response_type: "code",
+      client_id: OIDC_CONFIG.clientId,
+      redirect_uri: OIDC_CONFIG.redirectUri,
+      scope: OIDC_CONFIG.scope,
+      state,
+      nonce,
+      code_challenge: await sha256b64url(verifier),
+      code_challenge_method: "S256",
+    });
+    window.location.assign(`${d.authorization_endpoint}?${params}`);
+  } catch (e) {
+    setStatus(escapeHtml(e.message), true);
+  }
+}
+
+// ---------- callback ----------
+async function handleCallback(params) {
+  const saved = JSON.parse(store.getItem(KEYS.pkce) || "null");
+  store.removeItem(KEYS.pkce);
+  // Remove ?code=...&state=... from the address bar
+  history.replaceState({}, document.title, OIDC_CONFIG.redirectUri);
+
+  if (!saved) throw new Error("No login request found in this browser session. Please sign in again.");
+  if (params.get("state") !== saved.state) throw new Error("State mismatch. The response may be forged or stale.");
+
+  const d = await discovery();
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: params.get("code"),
+    redirect_uri: OIDC_CONFIG.redirectUri,
+    client_id: OIDC_CONFIG.clientId,
+    code_verifier: saved.verifier,
+  });
+  const res = await fetch(d.token_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const tokens = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Token exchange failed (${res.status}): ${tokens.error || ""} ${tokens.error_description || ""}`);
+  }
+
+  const claims = decodeJwt(tokens.id_token);
+  if (!claims) throw new Error("No valid id_token in the token response.");
+  validateIdToken(claims, d, saved.nonce);
+
+  let userInfo = null;
+  if (OIDC_CONFIG.fetchUserInfo && d.userinfo_endpoint && tokens.access_token) {
+    try {
+      const ui = await fetch(d.userinfo_endpoint, {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+      });
+      userInfo = ui.ok ? await ui.json() : { error: `UserInfo returned HTTP ${ui.status}` };
+    } catch (e) {
+      userInfo = { error: `UserInfo call failed: ${e.message} (CORS may not be enabled)` };
+    }
+  }
+
+  const session = { tokens, claims, userInfo, savedAt: Date.now() };
+  store.setItem(KEYS.session, JSON.stringify(session));
+  return session;
+}
+
+function validateIdToken(c, d, nonce) {
+  const now = Math.floor(Date.now() / 1000);
+  const aud = Array.isArray(c.aud) ? c.aud : [c.aud];
+  if (d.issuer && c.iss !== d.issuer) throw new Error(`Issuer mismatch: ${c.iss}`);
+  if (!aud.includes(OIDC_CONFIG.clientId)) throw new Error("Audience does not include this client_id.");
+  if (c.exp && c.exp < now - 60) throw new Error("ID token has expired.");
+  if (c.nonce !== nonce) throw new Error("Nonce mismatch.");
+  // Note: the JWT signature is not checked in the browser. The token came straight
+  // from the token endpoint over TLS. Backends must verify signatures before trusting tokens.
+}
+
+// ---------- logout ----------
+async function logout() {
+  const session = JSON.parse(store.getItem(KEYS.session) || "null");
+  store.removeItem(KEYS.session);
+  try {
+    const d = await discovery();
+    if (d.end_session_endpoint) {
+      const p = new URLSearchParams({
+        client_id: OIDC_CONFIG.clientId,
+        post_logout_redirect_uri: OIDC_CONFIG.postLogoutRedirectUri,
+      });
+      if (session?.tokens?.id_token) p.set("id_token_hint", session.tokens.id_token);
+      window.location.assign(`${d.end_session_endpoint}?${p}`);
+      return;
+    }
+  } catch { /* fall through to local logout */ }
+  render(null);
+}
+
+// ---------- rendering ----------
+const TIME_CLAIMS = new Set(["exp", "iat", "nbf", "auth_time", "updated_at"]);
+function formatValue(key, val) {
+  if (val !== null && typeof val === "object") {
+    return `<pre>${escapeHtml(JSON.stringify(val, null, 2))}</pre>`;
+  }
+  let html = escapeHtml(val);
+  if (TIME_CLAIMS.has(key) && typeof val === "number") {
+    html += `<small>${escapeHtml(new Date(val * 1000).toLocaleString())}</small>`;
+  }
+  return html;
+}
+function fillTable(tableId, obj) {
+  const rows = Object.keys(obj).sort().map(
+    (k) => `<tr><th>${escapeHtml(k)}</th><td>${formatValue(k, obj[k])}</td></tr>`
+  );
+  $(tableId).innerHTML = rows.join("") || `<tr><td class="muted">No attributes</td></tr>`;
+}
+function truncateTokens(t) {
+  const copy = { ...t };
+  for (const k of ["access_token", "id_token", "refresh_token"]) {
+    if (copy[k]) copy[k] = copy[k].slice(0, 20) + "…";
+  }
+  return copy;
+}
+
+function render(session) {
+  const signedIn = !!session;
+  show("loginBtn", !signedIn);
+  show("logoutBtn", signedIn);
+  show("welcome", !signedIn);
+  ["profileCard", "idTokenCard", "userInfoCard", "rawCard"].forEach((id) => show(id, signedIn));
+  if (!signedIn) return;
+
+  const { claims, userInfo, tokens } = session;
+  const merged = { ...claims, ...(userInfo && !userInfo.error ? userInfo : {}) };
+
+  $("displayName").textContent =
+    merged.name || [merged.given_name, merged.family_name].filter(Boolean).join(" ") ||
+    merged.preferred_username || merged.email || "Signed-in user";
+  $("displaySub").textContent = [merged.email, `sub: ${merged.sub}`].filter(Boolean).join(" · ");
+  if (merged.picture) { $("avatar").src = merged.picture; show("avatar", true); }
+  else show("avatar", false);
+
+  fillTable("idTokenTable", claims);
+  if (userInfo) {
+    fillTable("userInfoTable", userInfo);
+  } else {
+    show("userInfoCard", false);
+  }
+
+  $("rawIdToken").textContent = JSON.stringify(claims, null, 2);
+  $("rawUserInfo").textContent = userInfo ? JSON.stringify(userInfo, null, 2) : "(not requested)";
+  const at = decodeJwt(tokens.access_token);
+  $("rawAccessToken").textContent = at ? JSON.stringify(at, null, 2) : "(opaque access token, not a JWT)";
+  $("rawTokenResponse").textContent = JSON.stringify(truncateTokens(tokens), null, 2);
+}
+
+// ---------- boot ----------
+(async function init() {
+  $("loginBtn").onclick = login;
+  $("logoutBtn").onclick = logout;
+
+  if (OIDC_CONFIG.clientId === "YOUR_CLIENT_ID" || OIDC_CONFIG.authority.includes("YOUR-IDP-DOMAIN")) {
+    setStatus(`<b>Setup needed:</b> edit <code>OIDC_CONFIG</code> in <code>index.html</code>
+      and set <code>authority</code> and <code>clientId</code>.<br>
+      Register this redirect URI in your IdP: <code>${escapeHtml(OIDC_CONFIG.redirectUri)}</code>`);
+  }
+
+  const params = new URLSearchParams(window.location.search);
+  try {
+    if (params.has("error")) {
+      history.replaceState({}, document.title, OIDC_CONFIG.redirectUri);
+      throw new Error(`IdP returned an error: ${params.get("error")}\n${params.get("error_description") || ""}`);
+    }
+    if (params.has("code")) {
+      setStatus("Completing sign-in…");
+      const session = await handleCallback(params);
+      setStatus(`<span class="ok">Signed in successfully.</span>`);
+      render(session);
+      return;
+    }
+    render(JSON.parse(store.getItem(KEYS.session) || "null"));
+  } catch (e) {
+    setStatus(escapeHtml(e.message), true);
+    render(null);
+  }
+})();
+</script>
+</body>
+</html>
